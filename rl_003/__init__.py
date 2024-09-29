@@ -60,7 +60,7 @@ class REINFORCE(common.Agent):
         mean, stddev = self.pi(tf.reshape(observation, (-1, self.observation_shape[-1])), training=False)
         raw_action = tf.random.normal(tf.shape(mean), mean, stddev)
         action = tf.tanh(raw_action)
-        return action, raw_action
+        return action[0], raw_action[0]
 
 
 def training(episodes, model_path=None):
@@ -81,7 +81,7 @@ def training(episodes, model_path=None):
 
         while not done:
             action, raw_action = agent.action_sample(observation)
-            next_observation, reward, terminated, truncated, _ = env.step(action[0])
+            next_observation, reward, terminated, truncated, _ = env.step(action)
 
             observ_history.append(observation)
             action_history.append(raw_action)
@@ -104,12 +104,14 @@ def training(episodes, model_path=None):
 
         with tf.GradientTape() as tape:
             means, stddevs = agent.pi(observations, training=True)
-            log_prob = (tf.reduce_sum(tf.square((actions - means) / stddevs), axis=1) + LOG_2PI) * -0.5 - tf.reduce_sum(
-                tf.math.log(stddevs), axis=1
+            # log_prob = (tf.reduce_sum(tf.square((actions - means) / stddevs), axis=1) + LOG_2PI) * -0.5 - tf.reduce_sum(
+            #     tf.math.log(stddevs), axis=1
+            # )
+            log_prob = tf.reduce_sum(
+                (tf.square((actions - means) / stddevs) + LOG_2PI) * -0.5 - tf.math.log(stddevs), axis=1
             )
-
             log_prob -= tf.reduce_sum(tf.math.log(1.0 - tf.square(tf.tanh(actions)) + EPS), axis=1)
-            loss = tf.reduce_sum(log_prob * gs * -1.0)
+            loss = -tf.reduce_sum(log_prob * gs)
 
         grads = tape.gradient(loss, agent.pi.trainable_variables)
         agent.optimizer.apply_gradients(zip(grads, agent.pi.trainable_variables))

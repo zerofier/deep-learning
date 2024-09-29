@@ -8,7 +8,7 @@ def record_video(env, agent, video_folder):
     terminated = False
     while not (truncated or terminated):
         sample = agent.action_sample(observation)
-        action = sample[0][0]
+        action = sample[0]
         observation, reward, terminated, truncated, info = wrapper.step(action)
         wrapper.render()
 

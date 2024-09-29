@@ -21,17 +21,6 @@ LOG_2PI = np.log(2.0 * np.pi)
 LOG_FILE = os.path.join(CURRENT_DIR, f"loss_history_{datetime.now().strftime('%Y%m%dT%H%M%S')}.csv")
 
 
-class StddevLimter(keras.Layer):
-    """Limited for stddev value from NN output
-
-    See:
-        https://gymnasium.farama.org/tutorials/training_agents/reinforce_invpend_gym_v26/
-    """
-
-    def call(self, inputs):
-        return tf.math.log(tf.exp(inputs) + 1.0) + EPS
-
-
 class ActorCritic(common.Agent):
     def __init__(self, observation_shape, action_shape, model_path=None) -> None:
         self.gamma = 0.99
@@ -45,13 +34,12 @@ class ActorCritic(common.Agent):
         mean_output = keras.layers.Dense(self.action_shape[0], keras.activations.linear, name="mean_output")(
             hidden_layer2
         )
-        stddev_hidden = keras.layers.Dense(self.action_shape[0], keras.activations.linear, name="stddev_hidden")(
-            hidden_layer2
-        )
-        stddev_output = StddevLimter(name="stddev_output")(stddev_hidden)
-        value_output = keras.layers.Dense(1, keras.activations.linear, name="stddev_hidden")(hidden_layer2)
+        log_stddev_output = keras.layers.Dense(
+            self.action_shape[0], keras.activations.linear, name="log_stddev_output"
+        )(hidden_layer2)
+        value_output = keras.layers.Dense(1, keras.activations.linear, name="value_output")(hidden_layer2)
 
-        self.pi = keras.Model(inputs=inputs, outputs=[mean_output, stddev_output, value_output])
+        self.pi = keras.Model(inputs=inputs, outputs=[mean_output, log_stddev_output, value_output])
 
         self.optimizer = keras.optimizers.Adam(learning_rate=3e-4)
 
@@ -59,19 +47,10 @@ class ActorCritic(common.Agent):
             self.pi = keras.models.load_model(os.path.join(model_path, "model.keras"))
 
     def action_sample(self, observation):
-        mean, stddev, value = self.pi(tf.reshape(observation, (-1, self.observation_shape[-1])), training=False)
-        raw_action = tf.random.normal(tf.shape(mean), mean, stddev)
+        mean, log_stddev, value = self.pi(tf.reshape(observation, (-1, self.observation_shape[-1])), training=False)
+        raw_action = tf.random.normal(tf.shape(mean), mean, tf.exp(log_stddev) + EPS)
         action = tf.tanh(raw_action)
-        return action, raw_action, value
-
-
-@tf.function
-def log_prob(actions, means, stddevs):
-    ret = (tf.reduce_sum(tf.square((actions - means) / stddevs), axis=1) + LOG_2PI) * -0.5 - tf.reduce_sum(
-        tf.math.log(stddevs), axis=1
-    )
-    ret -= tf.reduce_sum(tf.math.log(1.0 - tf.square(tf.tanh(actions)) + EPS), axis=1)
-    return ret
+        return action[0], raw_action[0], value[0]
 
 
 def training(episodes, model_path=None):
@@ -93,11 +72,11 @@ def training(episodes, model_path=None):
 
         while not done:
             action, raw_action, value = agent.action_sample(observation)
-            next_observation, reward, terminated, truncated, _ = env.step(action[0])
+            next_observation, reward, terminated, truncated, _ = env.step(action)
 
             observ_history.append(observation)
             action_history.append(raw_action)
-            reward_history.append(reward)
+            reward_history.append([reward])
             value_history.append(value)
 
             observation = next_observation
@@ -105,21 +84,29 @@ def training(episodes, model_path=None):
 
         observations = tf.convert_to_tensor(observ_history)
         actions = tf.convert_to_tensor(action_history)
-        reward = tf.convert_to_tensor(reward_history)
-        values = tf.convert_to_tensor(value_history)
+        rewards = tf.convert_to_tensor(reward_history, dtype=actions.dtype)
+        next_values = tf.convert_to_tensor(value_history)
 
-        target = reward + agent.gamma * values
+        next_values = tf.concat([next_values[1:], [[0.0]]], axis=0)
+
+        target = rewards + agent.gamma * next_values
+
+        log_tanh = tf.reduce_sum(tf.math.log(1.0 - tf.square(tf.tanh(actions)) + EPS), axis=1, keepdims=True)
 
         # UPDATE MODEL
         with tf.GradientTape() as tape:
-            means, stddevs, values = agent.pi(observations, training=True)
+            means, log_stddevs, values = agent.pi(observations, training=True)
+            stddevs = tf.exp(log_stddevs) + EPS
 
-            log_prob = log_prob(actions, means, stddevs)
+            log_prob = -0.5 * ((actions - means) / stddevs) ** 2 - log_stddevs - 0.5 * +LOG_2PI
+            log_prob = tf.reduce_sum(log_prob, axis=1, keepdims=True)
+            #
+            log_prob -= log_tanh
 
-            diff = target - values
+            delta = target - values
 
-            actor_loss = -tf.reduce_sum(log_prob * diff)
-            critic_loss = tf.reduce_sum(tf.square(diff))
+            actor_loss = -tf.reduce_sum(log_prob * delta)
+            critic_loss = tf.reduce_sum(delta**2)
             loss = actor_loss + critic_loss
 
         grads = tape.gradient(loss, agent.pi.trainable_variables)
